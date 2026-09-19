@@ -1,12 +1,6 @@
 """Qwen3's RMSNorm in Triton, written to match the reference exactly.
 
-Nothing imports this. It is here to demonstrate the two things the baseline
-never shows: how a module beside ``engine.py`` is vendored and imported, and how
-closely a fused kernel has to follow the reference's arithmetic to stay inside
-the tie margin.
-
-To use it, swap it in for the ``Qwen3RMSNorm`` modules on the loaded model in
-``Engine.__init__``. Delete this package if you would rather start clean.
+Used for the first layer; later layers fuse residual addition with this norm.
 """
 
 import torch
@@ -66,6 +60,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         n_cols,
         eps,
         BLOCK=block,
-        num_warps=max(4, min(16, block // 256)),
+        num_warps=4,
+        enable_fp_fusion=False,
     )
     return out.reshape(shape)
