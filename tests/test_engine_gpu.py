@@ -19,6 +19,7 @@ from runtime import Model
 from kernels.rmsnorm import rms_norm
 from kernels.pointwise import add_rms_norm, prepare_qkv, swiglu
 from kernels.attention import decode_attention
+from kernels.linear import Projection
 
 
 def norm(x, weight, eps=1e-6):
@@ -30,6 +31,19 @@ def norm(x, weight, eps=1e-6):
 class KernelTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(1234)
+
+    @torch.inference_mode()
+    def test_bf16_projection_split_reduction_and_masked_tails(self):
+        for batch in (1, 4, 16):
+            x = torch.randn(batch, 1003, device="cuda", dtype=torch.bfloat16)
+            w = torch.randn(37, 1003, device="cuda", dtype=torch.bfloat16)
+            expected = F.linear(x.double(), w.double()).bfloat16()
+            configs = [("gemm", 32, 64, 1), ("gemm", 64, 64, 4), ("gemm", 64, 64, 8)]
+            if batch == 1:
+                configs += [("gemv", 4, 512, 1), ("gemv", 4, 512, 4)]
+            for config in configs:
+                actual = Projection(batch, 37, 1003, config)(x, w)
+                torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
 
     @torch.inference_mode()
     def test_norm_residual_and_swiglu_rounding(self):
@@ -71,19 +85,19 @@ class KernelTests(unittest.TestCase):
 
     @torch.inference_mode()
     def test_attention_partial_blocks_grouped_heads_and_poisoned_tail(self):
-        for batch in (1, 3, 16):
+        for batch, block in ((1, 64), (1, 256), (3, 64), (3, 256), (16, 256)):
             nq, nk, dim, cap = 32, 8, 128, 2121
-            splits = (cap + 255) // 256
+            splits = (cap + block - 1) // block
             partial = torch.empty(batch, nq, splits, dim, device="cuda", dtype=torch.float32)
             lse = torch.empty(batch, nq, splits, device="cuda", dtype=torch.float32)
-            for length in (1, 255, 256, 257, 513, 2112):
+            for length in (1, 63, 64, 65, 255, 256, 257, 513, 2112):
                 q = torch.randn(batch, nq, 1, dim, device="cuda", dtype=torch.bfloat16)
                 k = torch.randn(batch, nk, cap, dim, device="cuda", dtype=torch.bfloat16)
                 v = torch.randn_like(k)
                 k[:, :, length:] = float("nan")
                 v[:, :, length:] = float("nan")
                 pos = torch.tensor(length - 1, device="cuda", dtype=torch.int32)
-                actual = decode_attention(q, k, v, pos, partial, lse)
+                actual = decode_attention(q, k, v, pos, partial, lse, block)
                 expected = F.scaled_dot_product_attention(
                     q, k[:, :, :length].repeat_interleave(nq // nk, dim=1),
                     v[:, :, :length].repeat_interleave(nq // nk, dim=1),
@@ -137,6 +151,15 @@ class GenerationTests(unittest.TestCase):
         reference = Qwen3ForCausalLM(config).eval().to(device="cuda", dtype=torch.bfloat16)
         engine = Engine.__new__(Engine)
         engine.model, engine.state = Model(reference), None
+        layer = engine.model.layers[0]
+        # Exercise custom split-K projections even if this GPU would select
+        # cuBLAS in its warmup. Full-width logits test their composed numerics.
+        weights = {"qkv": layer.qkv, "out": layer.out, "gate_up": layer.gate_up,
+                   "down": layer.down, "lm_head": engine.model.lm_head}
+        engine.model.projection_plans[4] = {
+            name: Projection(4, *weight.shape, ("gemm", 64, 64, 4))
+            for name, weight in weights.items()
+        }
         ids = torch.randint(0, config.vocab_size, (4, 129), device="cuda")
         list(engine.generate(ids.tolist(), 5))
         state = engine.state

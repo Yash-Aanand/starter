@@ -33,6 +33,35 @@ def _partial(Q, K, V, POS, OUT, LSE,
 
 
 @triton.jit
+def _tensor_partial(Q, K, V, POS, OUT, LSE,
+                    NQ: tl.constexpr, NK: tl.constexpr, CAP: tl.constexpr,
+                    D: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr):
+    # One tile shares each KV head among its query heads. Pad the four queries
+    # to a tensor-core tile; padded heads never read Q or write a result.
+    kv_batch, split = tl.program_id(0), tl.program_id(1)
+    b, kv = kv_batch // NK, kv_batch % NK
+    length = tl.load(POS) + 1
+    h, d = tl.arange(0, 16), tl.arange(0, D)
+    n = split * BLOCK + tl.arange(0, BLOCK)
+    valid = (n < length) & (n < CAP)
+    head_batch = b * NQ + kv * (NQ // NK) + h
+    q = tl.load(Q + head_batch[:, None] * D + d[None, :], h[:, None] < NQ // NK, 0)
+    k = tl.load(K + ((b * NK + kv) * CAP + n[None, :]) * D + d[:, None], valid[None, :], 0)
+    scores = tl.dot(q, k) * (D ** -0.5)
+    scores = tl.where(valid[None, :], scores, -float("inf"))
+    maximum = tl.max(scores, 1)
+    safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = tl.exp(scores - safe_max[:, None])
+    denom = tl.sum(weights, 1)
+    v = tl.load(V + ((b * NK + kv) * CAP + n[:, None]) * D + d[None, :], valid[:, None], 0)
+    # Dense BF16 attention with FP32 dot accumulation and softmax reductions.
+    result = tl.dot(weights.to(v.dtype), v) / tl.maximum(denom[:, None], 1.0e-20)
+    base = head_batch * SPLITS + split
+    tl.store(OUT + base[:, None] * D + d[None, :], result, h[:, None] < NQ // NK)
+    tl.store(LSE + base, tl.where(denom > 0, safe_max + tl.log(denom), -float("inf")), h < NQ // NK)
+
+
+@triton.jit
 def _merge(PART, LSE, OUT, SPLITS: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
     head_batch = tl.program_id(0)
     s, d = tl.arange(0, BLOCK), tl.arange(0, D)
@@ -44,7 +73,7 @@ def _merge(PART, LSE, OUT, SPLITS: tl.constexpr, D: tl.constexpr, BLOCK: tl.cons
     tl.store(OUT + head_batch * D + d, result)
 
 
-def decode_attention(q, key, value, position, partial, lse):
+def decode_attention(q, key, value, position, partial, lse, block=256):
     """Q [B,Nq,1,D], cache [B,Nkv,C,D], device POS = new token's slot.
 
     Reads slots 0..POS only. Caller owns reusable FP32 partial storage.
@@ -53,9 +82,12 @@ def decode_attention(q, key, value, position, partial, lse):
     batch, nq, _, dim = q.shape
     splits = partial.shape[2]
     out = torch.empty((batch, nq, dim), dtype=q.dtype, device=q.device)
-    _partial[(batch * nq, splits)](
+    nk = key.shape[1]
+    grouped = nq // nk <= 16
+    kernel = _tensor_partial if grouped else _partial
+    kernel[(batch * (nk if grouped else nq), splits)](
         q, key, value, position, partial, lse,
-        nq, key.shape[1], key.shape[2], dim, splits, 256, num_warps=8,
+        nq, nk, key.shape[2], dim, splits, block, num_warps=4 if block <= 128 else 8,
     )
     _merge[(batch * nq,)](
         partial, lse, out, splits, dim, triton.next_power_of_2(splits), num_warps=4,

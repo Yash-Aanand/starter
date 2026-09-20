@@ -7,6 +7,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from kernels.rmsnorm import rms_norm
 from kernels.pointwise import add_rms_norm, swiglu, prepare_qkv
 from kernels.attention import decode_attention
+from kernels.linear import choose_projections, project
 
 
 class Layer:
@@ -36,9 +37,11 @@ class Model:
         self.norm = reference.model.norm.weight
         self.rope = reference.model.rotary_emb
         self.layers = [Layer(layer) for layer in reference.model.layers]
+        self.projection_plans = {}
 
     def forward(self, ids, state, prefill=False):
         batch, length = ids.shape
+        plans = {} if prefill else state.projections
         x = F.embedding(ids, self.embedding)
         residual = None
         for i, layer in enumerate(self.layers):
@@ -47,7 +50,7 @@ class Model:
                 normed = rms_norm(x, layer.input_norm, self.eps)
             else:
                 residual, normed = add_rms_norm(x, residual, layer.input_norm, self.eps)
-            qkv = F.linear(normed, layer.qkv)
+            qkv = project(normed, layer.qkv, plans.get("qkv"))
             q = prepare_qkv(
                 qkv, layer.q_norm, layer.k_norm, state.cos, state.sin,
                 state.position, state.keys[i], state.values[i],
@@ -56,33 +59,45 @@ class Model:
             if prefill:
                 # Only initialized prompt slots are visible. Flash SDPA's GQA
                 # avoids copying the eight KV heads into 32 physical heads.
+                last_layer = i == len(self.layers) - 1
+                if last_layer:
+                    # All prompt K/V entries are needed by future decode steps,
+                    # but only the last query's output reaches the logits.
+                    q = q[:, :, -1:, :]
+                    residual = residual[:, -1:, :].contiguous()
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     attn = F.scaled_dot_product_attention(
                         q, state.keys[i][:, :, :length],
                         state.values[i][:, :, :length],
-                        is_causal=True, enable_gqa=True,
+                        # This query is at the END of the prompt and sees all
+                        # its keys. A one-row causal mask would expose only K[0].
+                        is_causal=not last_layer, enable_gqa=True,
                     )
-                attn = attn.transpose(1, 2).reshape(batch, length, -1)
+                attn = attn.transpose(1, 2).reshape(batch, 1 if last_layer else length, -1)
             else:
                 attn = decode_attention(
                     q, state.keys[i], state.values[i], state.position,
-                    state.partial, state.lse,
+                    state.partial, state.lse, state.attention_block,
                 ).view(batch, 1, -1)
-            projected = F.linear(attn, layer.out)
+            projected = project(attn, layer.out, plans.get("out"))
             residual, normed = add_rms_norm(projected, residual, layer.post_norm, self.eps)
-            x = F.linear(swiglu(F.linear(normed, layer.gate_up)), layer.down)
+            gate_up = project(normed, layer.gate_up, plans.get("gate_up"))
+            x = project(swiglu(gate_up), layer.down, plans.get("down"))
         # Only the last prompt position needs final normalization and logits.
         residual, normed = add_rms_norm(
             x[:, -1:, :].contiguous(), residual[:, -1:, :].contiguous(),
             self.norm, self.eps,
         )
-        return F.linear(normed[:, 0], self.lm_head)
+        return project(normed[:, 0], self.lm_head, state.projections.get("lm_head"))
 
 
 class Generation:
     def __init__(self, model, shape):
         self.model, self.shape = model, shape
         batch, prompt, output = shape
+        if batch not in model.projection_plans:
+            model.projection_plans[batch] = choose_projections(model, batch)
+        self.projections = model.projection_plans[batch]
         self.capacity = prompt + output
         device = model.embedding.device
         self.position = torch.zeros((), dtype=torch.int32, device=device)
@@ -96,7 +111,10 @@ class Generation:
         positions = torch.arange(self.capacity, device=device).unsqueeze(0)
         self.cos, self.sin = (t.squeeze(0).contiguous() for t in model.rope(
             model.embedding, positions))
-        splits = (self.capacity + 255) // 256
+        # More splits keep small batches parallel; larger batches amortize
+        # tile setup with longer blocks. Fixed for the entire workload.
+        self.attention_block = 64 if batch <= 2 else 256
+        splits = (self.capacity + self.attention_block - 1) // self.attention_block
         self.partial = torch.empty((batch, model.nq, splits, model.dim),
                                    dtype=torch.float32, device=device)
         self.lse = torch.empty((batch, model.nq, splits), dtype=torch.float32, device=device)

@@ -39,7 +39,42 @@ these are not full-model results):
 | 4 / 2048 / 32 | 159.648 / 10.241 | 106.530 / 5.850 |
 | 16 / 512 / 128 | 195.148 / 11.097 | 100.962 / 6.070 |
 
-H100 result pending. Target to beat: 1,144.3 tok/s.
+H100 run `507b996b-20ce-4031-ae29-7cc1d9f5c265` succeeded and ranked at
+**729.5392 tok/s**. Public workloads: 202.83 / 411.61 / 2196.07 tok/s;
+TTFT 11.46 / 120.25 / 111.90 ms; TPOT 4.72 / 6.14 / 6.46 ms.
+The earlier leased run timed out in infrastructure; this was a rerun of the
+same `bfa2659` submission. Current target: **at least 1,400 tok/s**.
+
+## Candidate 2: final-position prefill, grouped attention, tuned projections
+
+- Final layer still fills the entire prompt KV cache, but computes attention,
+  output projection and MLP only for its final query. Its attention is noncausal
+  because the final query can see every preceding prompt key.
+- Decode attention groups query heads on BF16 tensor cores with FP32 softmax
+  and accumulation. Scalar grouping alone was slower and was rejected.
+- Small-batch BF16 GEMM/GEMV kernels offer split-K parallelism. Warmup compares
+  these against cuBLAS on the actual device, separately per projection shape.
+  Rotating weight copies exceed L2 capacity to avoid misleading hot-cache wins.
+  Choices and buffers remain fixed for all measured samples.
+- Full-width cached logits, teacher-forced continuations, poisoned cache tails,
+  and split-K arithmetic are covered by local GPU tests. H100 score pending.
+
+Local two-layer A/B before projection tuning (same weights, alternating order):
+
+| Batch / prompt / output | Before TTFT / TPOT ms | After TTFT / TPOT ms |
+| --- | --- | --- |
+| 1 / 512 / 32 | 9.157 / 4.982 | 7.604 / 4.979 |
+| 4 / 2048 / 32 | 98.204 / 5.351 | 59.516 / 5.320 |
+| 16 / 512 / 128 | 93.165 / 5.489 | 56.993 / 5.443 |
+
+The large two-layer prefill gain must not be extrapolated to 36 layers: only
+the final layer is pruned. Projection microbenchmarks found the down projection
+improved from 282 to 209 us (B4) and 285 to 211 us (B16) on the laptop. Other
+projections were mostly bandwidth-limited there; H100 tuning may differ.
+
+References: [PyTorch GPT-fast](https://pytorch.org/blog/accelerating-generative-ai-2/),
+[Triton matmul](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html),
+[Triton attention](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html).
 
 Local Python lives at `/home/yasha/.cache/dryft-starter-venv/bin/python` in WSL,
 outside the Windows editor's environment-discovery path. From PowerShell:
