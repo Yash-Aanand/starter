@@ -53,12 +53,12 @@ def swiglu(packed):
 @triton.jit
 def _qkv(QKV, QW, KW, COS, SIN, POS, Q, K, V,
          T: tl.constexpr, CAP: tl.constexpr, NQ: tl.constexpr, NK: tl.constexpr,
-         D: tl.constexpr, EPS: tl.constexpr, HEADS: tl.constexpr):
+         D: tl.constexpr, EPS: tl.constexpr, HEADS: tl.constexpr, POS_STRIDE: tl.constexpr):
     row = tl.program_id(0)
     head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)
     b, t = row // T, row % T
     d = tl.arange(0, D)
-    position = tl.load(POS) + t
+    position = tl.load(POS + b * POS_STRIDE) + t
     src = row * (NQ + 2 * NK) * D + head[:, None] * D + d[None, :]
     valid = head < NQ + 2 * NK
     x = tl.load(QKV + src, valid[:, None], 0).to(tl.float32)
@@ -96,14 +96,14 @@ def _qkv(QKV, QW, KW, COS, SIN, POS, Q, K, V,
 def prepare_qkv(packed, qw, kw, cos, sin, position, key, value, nq, nk, dim, eps):
     """Packed [B,T,(Nq+2Nk)*D] -> Q [B,Nq,T,D]; writes K/V at POS+t.
 
-    Contiguous BF16 tensors except the int32 device scalar position.
+    Position is an int32 device scalar or one absolute offset per sequence.
     Cache layout is [B,Nk,capacity,D]; returned Q owns its storage.
     """
     batch, length, _ = packed.shape
     q = torch.empty((batch, nq, length, dim), dtype=packed.dtype, device=packed.device)
     _qkv[(batch * length, triton.cdiv(nq + 2 * nk, 8))](
         packed, qw, kw, cos, sin, position, q, key, value,
-        length, key.shape[2], nq, nk, dim, eps, 8,
+        length, key.shape[2], nq, nk, dim, eps, 8, int(position.numel() > 1),
         num_warps=4, enable_fp_fusion=False,
     )
     return q

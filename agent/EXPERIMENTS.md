@@ -57,7 +57,13 @@ same `bfa2659` submission. Current target: **at least 1,400 tok/s**.
   Rotating weight copies exceed L2 capacity to avoid misleading hot-cache wins.
   Choices and buffers remain fixed for all measured samples.
 - Full-width cached logits, teacher-forced continuations, poisoned cache tails,
-  and split-K arithmetic are covered by local GPU tests. H100 score pending.
+  and split-K arithmetic are covered by local GPU tests.
+
+Commit `a9b6b178d0781b83c2bfc792d999067219913689`, run
+`41cc7664-0d0d-461d-970d-005d3c973792`: **878.0587 tok/s**, ranked, all cases
+passed. Public throughput 229.23 / 467.64 / 2725.99 tok/s; TTFT
+13.87 / 119.69 / 107.76 ms; TPOT 4.06 / 4.92 / 5.09 ms. Run took nine minutes.
+The user raised the target to **1,500 tok/s**.
 
 Local two-layer A/B before projection tuning (same weights, alternating order):
 
@@ -75,6 +81,32 @@ projections were mostly bandwidth-limited there; H100 tuning may differ.
 References: [PyTorch GPT-fast](https://pytorch.org/blog/accelerating-generative-ai-2/),
 [Triton matmul](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html),
 [Triton attention](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html).
+
+## Candidate 3: verified multi-token lookup with single-token fallback
+
+Lookup proposes a continuation from a matching suffix within the current
+sequence; otherwise, carried predictions from the previous verification pass
+act as guesses. A dense, causal full-model pass checks every proposed prefix.
+Only greedy tokens through the first mismatch are emitted. Sequences maintain
+independent cache positions; unwritten/future cache slots stay masked.
+
+Four-token verification for batches up to four, two-token verification for
+larger batches. Every four passes, insufficient acceptance compared with the
+GPU's measured verification cost switches to a captured one-token path.
+History, guesses and acceptance tracking reset for every generation.
+
+This is an H100 experiment, not a claimed speedup: random-model local runs had
+poor acceptance and switched to ordinary decoding, with roughly 0-5% overhead.
+The real corpus and trained model determine whether it helps. Fresh prompts
+across the five samples also make the timing-spread gate a material concern.
+Earlier 878.1 tok/s commit remains available for rollback.
+
+Additional tests cover first-mismatch acceptance, divergent sequence positions,
+finished sequences, two- and four-token blocks, causal multi-query attention,
+teacher-forced continuations, and complete resets.
+
+References: [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding),
+[LMSYS lookahead decoding](https://lmsys.org/blog/2023-11-21-lookahead-decoding/).
 
 Local Python lives at `/home/yasha/.cache/dryft-starter-venv/bin/python` in WSL,
 outside the Windows editor's environment-discovery path. From PowerShell:

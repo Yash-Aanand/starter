@@ -39,7 +39,7 @@ class Model:
         self.layers = [Layer(layer) for layer in reference.model.layers]
         self.projection_plans = {}
 
-    def forward(self, ids, state, prefill=False):
+    def forward(self, ids, state, prefill=False, all_logits=False):
         batch, length = ids.shape
         plans = {} if prefill else state.projections
         x = F.embedding(ids, self.embedding)
@@ -78,12 +78,16 @@ class Model:
                 attn = decode_attention(
                     q, state.keys[i], state.values[i], state.position,
                     state.partial, state.lse, state.attention_block,
-                ).view(batch, 1, -1)
+                )
+                attn = attn.view(batch, 1, -1) if length == 1 else attn.transpose(1, 2).reshape(batch, length, -1)
             projected = project(attn, layer.out, plans.get("out"))
             residual, normed = add_rms_norm(projected, residual, layer.post_norm, self.eps)
             gate_up = project(normed, layer.gate_up, plans.get("gate_up"))
             x = project(swiglu(gate_up), layer.down, plans.get("down"))
         # Only the last prompt position needs final normalization and logits.
+        if all_logits:
+            _, normed = add_rms_norm(x, residual, self.norm, self.eps)
+            return project(normed, self.lm_head, state.projections.get("lm_head"))
         residual, normed = add_rms_norm(
             x[:, -1:, :].contiguous(), residual[:, -1:, :].contiguous(),
             self.norm, self.eps,
@@ -92,13 +96,13 @@ class Model:
 
 
 class Generation:
-    def __init__(self, model, shape):
+    def __init__(self, model, shape, reserve=0):
         self.model, self.shape = model, shape
         batch, prompt, output = shape
         if batch not in model.projection_plans:
             model.projection_plans[batch] = choose_projections(model, batch)
         self.projections = model.projection_plans[batch]
-        self.capacity = prompt + output
+        self.capacity = prompt + output + reserve
         device = model.embedding.device
         self.position = torch.zeros((), dtype=torch.int32, device=device)
         self.tokens = torch.zeros((batch, 1), dtype=torch.int64, device=device)

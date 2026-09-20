@@ -133,8 +133,9 @@ class GenerationTests(unittest.TestCase):
             gap = replay.amax(-1) - replay.gather(-1, continuation.unsqueeze(-1)).squeeze(-1)
             self.assertLessEqual(gap.max().item(), 0.15)
             # Compare first-step logits as well as token choices.
-            engine.state.position.zero_()
-            actual = engine.model.forward(ids, engine.state, prefill=True)
+            state = getattr(engine.state, "base", engine.state)
+            state.position.zero_()
+            actual = engine.model.forward(ids, state, prefill=True)
             expected = reference(ids, logits_to_keep=1, use_cache=False).logits[:, 0]
             torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.04)
 
@@ -161,8 +162,11 @@ class GenerationTests(unittest.TestCase):
             for name, weight in weights.items()
         }
         ids = torch.randint(0, config.vocab_size, (4, 129), device="cuda")
-        list(engine.generate(ids.tolist(), 5))
-        state = engine.state
+        emitted = torch.tensor(list(engine.generate(ids.tolist(), 5)), device="cuda").T
+        replay = reference(torch.cat((ids, emitted), 1), use_cache=False).logits[:, 128:133]
+        gap = replay.amax(-1) - replay.gather(-1, emitted.unsqueeze(-1)).squeeze(-1)
+        self.assertLessEqual(gap.max().item(), 0.3)
+        state = getattr(engine.state, "base", engine.state)
         state.prefill(ids.tolist())
         native = reference(ids, logits_to_keep=1, use_cache=True)
         for _ in range(4):

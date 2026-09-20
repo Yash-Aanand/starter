@@ -35,20 +35,23 @@ def _partial(Q, K, V, POS, OUT, LSE,
 @triton.jit
 def _tensor_partial(Q, K, V, POS, OUT, LSE,
                     NQ: tl.constexpr, NK: tl.constexpr, CAP: tl.constexpr,
-                    D: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr):
+                    D: tl.constexpr, SPLITS: tl.constexpr, BLOCK: tl.constexpr,
+                    T: tl.constexpr = 1, POS_STRIDE: tl.constexpr = 0,
+                    BM: tl.constexpr = 16):
     # One tile shares each KV head among its query heads. Pad the four queries
     # to a tensor-core tile; padded heads never read Q or write a result.
     kv_batch, split = tl.program_id(0), tl.program_id(1)
     b, kv = kv_batch // NK, kv_batch % NK
-    length = tl.load(POS) + 1
-    h, d = tl.arange(0, 16), tl.arange(0, D)
+    position = tl.load(POS + b * POS_STRIDE)
+    length = position + T
+    h, d = tl.arange(0, BM), tl.arange(0, D)
     n = split * BLOCK + tl.arange(0, BLOCK)
     valid = (n < length) & (n < CAP)
-    head_batch = b * NQ + kv * (NQ // NK) + h
-    q = tl.load(Q + head_batch[:, None] * D + d[None, :], h[:, None] < NQ // NK, 0)
+    head_batch = (b * NQ + kv * (NQ // NK)) * T + h
+    q = tl.load(Q + head_batch[:, None] * D + d[None, :], h[:, None] < (NQ // NK) * T, 0)
     k = tl.load(K + ((b * NK + kv) * CAP + n[None, :]) * D + d[:, None], valid[None, :], 0)
     scores = tl.dot(q, k) * (D ** -0.5)
-    scores = tl.where(valid[None, :], scores, -float("inf"))
+    scores = tl.where(valid[None, :] & (n[None, :] <= position + (h % T)[:, None]), scores, -float("inf"))
     maximum = tl.max(scores, 1)
     safe_max = tl.where(maximum == -float("inf"), 0.0, maximum)
     weights = tl.exp(scores - safe_max[:, None])
@@ -57,8 +60,8 @@ def _tensor_partial(Q, K, V, POS, OUT, LSE,
     # Dense BF16 attention with FP32 dot accumulation and softmax reductions.
     result = tl.dot(weights.to(v.dtype), v) / tl.maximum(denom[:, None], 1.0e-20)
     base = head_batch * SPLITS + split
-    tl.store(OUT + base[:, None] * D + d[None, :], result, h[:, None] < NQ // NK)
-    tl.store(LSE + base, tl.where(denom > 0, safe_max + tl.log(denom), -float("inf")), h < NQ // NK)
+    tl.store(OUT + base[:, None] * D + d[None, :], result, h[:, None] < (NQ // NK) * T)
+    tl.store(LSE + base, tl.where(denom > 0, safe_max + tl.log(denom), -float("inf")), h < (NQ // NK) * T)
 
 
 @triton.jit
@@ -79,17 +82,17 @@ def decode_attention(q, key, value, position, partial, lse, block=256):
     Reads slots 0..POS only. Caller owns reusable FP32 partial storage.
     Returns a new contiguous BF16 [B,Nq,D] tensor.
     """
-    batch, nq, _, dim = q.shape
-    splits = partial.shape[2]
-    out = torch.empty((batch, nq, dim), dtype=q.dtype, device=q.device)
+    batch, nq, length, dim = q.shape
+    splits = partial.shape[-2]
+    out = torch.empty((batch, nq, length, dim), dtype=q.dtype, device=q.device)
     nk = key.shape[1]
-    grouped = nq // nk <= 16
-    kernel = _tensor_partial if grouped else _partial
-    kernel[(batch * (nk if grouped else nq), splits)](
+    _tensor_partial[(batch * nk, splits)](
         q, key, value, position, partial, lse,
-        nq, nk, key.shape[2], dim, splits, block, num_warps=4 if block <= 128 else 8,
+        nq, nk, key.shape[2], dim, splits, block, length, int(position.numel() > 1),
+        max(16, triton.next_power_of_2(nq // nk * length)),
+        num_warps=4 if block <= 128 else 8,
     )
-    _merge[(batch * nq,)](
+    _merge[(batch * nq * length,)](
         partial, lse, out, splits, dim, triton.next_power_of_2(splits), num_warps=4,
     )
-    return out
+    return out.squeeze(2) if length == 1 else out
