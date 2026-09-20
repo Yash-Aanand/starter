@@ -38,6 +38,7 @@ class Model:
         self.rope = reference.model.rotary_emb
         self.layers = [Layer(layer) for layer in reference.model.layers]
         self.projection_plans = {}
+        self.packed_weights = {}
 
     def forward(self, ids, state, prefill=False, all_logits=False):
         batch, length = ids.shape
@@ -106,7 +107,7 @@ class Generation:
         device = model.embedding.device
         self.position = torch.zeros((), dtype=torch.int32, device=device)
         self.tokens = torch.zeros((batch, 1), dtype=torch.int64, device=device)
-        self.prompt = torch.empty((batch, prompt), dtype=torch.int64, device=device)
+        self.prompt = torch.zeros((batch, prompt), dtype=torch.int64, device=device)
         cache_shape = (batch, model.nkv, self.capacity, model.dim)
         self.keys = [torch.empty(cache_shape, dtype=torch.bfloat16, device=device)
                      for _ in model.layers]
@@ -125,6 +126,7 @@ class Generation:
         self.graph = None
         if output > 1:
             self.capture()
+        self.capture_prefill()
 
     def step(self):
         logits = self.model.forward(self.tokens, self)
@@ -149,10 +151,26 @@ class Generation:
             self.step()
         torch.cuda.current_stream().wait_stream(stream)
 
-    def prefill(self, input_ids):
+    def prefill_step(self):
         self.position.zero_()
-        self.prompt.copy_(torch.tensor(input_ids, dtype=torch.int64, device="cpu"))
         logits = self.model.forward(self.prompt, self, prefill=True)
         torch.argmax(logits, dim=-1, keepdim=True, out=self.tokens)
         # Prompt slots were overwritten; later slots remain masked until used.
         self.position.fill_(self.shape[1])
+
+    def capture_prefill(self):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self.prefill_step()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        stream.wait_stream(torch.cuda.current_stream())
+        self.prefill_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.prefill_graph, stream=stream):
+            self.prefill_step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+    def prefill(self, input_ids):
+        self.prompt.copy_(torch.tensor(input_ids, dtype=torch.int64, device="cpu"))
+        self.prefill_graph.replay()

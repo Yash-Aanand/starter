@@ -108,6 +108,49 @@ teacher-forced continuations, and complete resets.
 References: [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding),
 [LMSYS lookahead decoding](https://lmsys.org/blog/2023-11-21-lookahead-decoding/).
 
+Commit `f11b249e615efe4c2e55a12f6cd9f8afae8063f1`, run
+`59ee9d7b-c44e-4804-bfa2-d9d2ba588833`: **868.0842 tok/s**, ranked.
+Public throughput 222.02 / 467.44 / 2703.93 tok/s. This regressed from 878.0587;
+lookup was removed from the submitted engine and retained in `agent/speculative.py`.
+
+## Candidate 4: lossless weight storage and captured prefill
+
+Returns to ordinary one-token decoding. Selected projections reconstruct the
+original BF16 weight bits from sign/mantissa bytes and four-bit exponent offsets.
+Each 128-element block stores its minimum exponent; a block whose range exceeds
+15 reads the original BF16 values instead. Those originals remain available for
+prefill. This is lossless storage, with no rounding or quantization of weights.
+A single GPU encoding kernel per matrix keeps setup bounded. The compact arrays
+use 75.8% of the original weight bytes, plus sparse reads of exceptional blocks.
+
+Warmup benchmarks four packed configurations against the existing kernels on
+the actual GPU, with weight buffers larger than L2. Only measured winners are
+selected, and their choices stay fixed across samples. Prefill now also replays
+a CUDA graph; each call resets cache positions and overwrites the prompt cache.
+
+All 12 local GPU tests pass on the pinned runtime, including all 65,536 BF16 bit
+patterns (signed zeros, subnormals, infinities and NaN payloads), masked matrix
+tails, split reductions, full-width teacher-forced logits, graph replay and
+prompt resets. Archive validation and `git diff --check` pass.
+
+Final local A/B uses identical random **two-layer** models on RTX 4070, alternating
+execution order. These timings do not predict the full-model H100 score:
+
+| Batch / prompt / output | 878-path TTFT / TPOT ms | Candidate TTFT / TPOT ms |
+| --- | --- | --- |
+| 1 / 512 / 32 | 8.323 / 5.463 | 7.537 / 4.490 |
+| 4 / 2048 / 32 | 54.672 / 4.954 | 54.054 / 4.159 |
+| 16 / 512 / 128 | 62.280 / 6.007 | 61.705 / 5.487 |
+
+Simple weight transposition and fused gate/up plus SwiGLU were also measured;
+neither consistently beat the existing selected kernels. Their prototypes stay
+in `agent/projection_layout_experiment.py`. `agent/lossless_experiment.py` records
+the earlier sparse-exponent-table prototype; production instead uses original
+weights for exceptional blocks to reduce encoding time and metadata traffic.
+
+The target remains **1,500 tok/s**, not yet achieved. Inspect the next official
+result before making another change; the best verified score is still 878.0587.
+
 Local Python lives at `/home/yasha/.cache/dryft-starter-venv/bin/python` in WSL,
 outside the Windows editor's environment-discovery path. From PowerShell:
 

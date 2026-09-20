@@ -20,6 +20,7 @@ from kernels.rmsnorm import rms_norm
 from kernels.pointwise import add_rms_norm, prepare_qkv, swiglu
 from kernels.attention import decode_attention
 from kernels.linear import Projection
+from kernels.packed_linear import PackedProjection, pack
 
 
 def norm(x, weight, eps=1e-6):
@@ -153,12 +154,17 @@ class GenerationTests(unittest.TestCase):
         engine = Engine.__new__(Engine)
         engine.model, engine.state = Model(reference), None
         layer = engine.model.layers[0]
-        # Exercise custom split-K projections even if this GPU would select
-        # cuBLAS in its warmup. Full-width logits test their composed numerics.
+        # Force lossless projections even if tuning would choose cuBLAS.
+        # Their composition is checked against teacher-forced native logits.
         weights = {"qkv": layer.qkv, "out": layer.out, "gate_up": layer.gate_up,
                    "down": layer.down, "lm_head": engine.model.lm_head}
+        for layer in engine.model.layers:
+            for name in ("qkv", "out", "gate_up", "down"):
+                weight = getattr(layer, name)
+                engine.model.packed_weights[weight.data_ptr()] = pack(weight)
+        engine.model.packed_weights[engine.model.lm_head.data_ptr()] = pack(engine.model.lm_head)
         engine.model.projection_plans[4] = {
-            name: Projection(4, *weight.shape, ("gemm", 64, 64, 4))
+            name: PackedProjection(4, *weight.shape, (64, 128, 4), engine.model.packed_weights)
             for name, weight in weights.items()
         }
         ids = torch.randint(0, config.vocab_size, (4, 129), device="cuda")

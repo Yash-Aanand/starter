@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from kernels.packed_linear import pack, PackedProjection
 
 
 @triton.jit
@@ -123,8 +124,34 @@ def choose_projections(model, batch):
             # Keep cuBLAS unless a candidate wins beyond small timing noise.
             if elapsed < best_time * 0.97:
                 best, best_time = candidate, elapsed
+        # Lossless storage is useful only when its decode work costs less than
+        # the memory traffic it saves. Measure it on this GPU during warmup.
+        if batch <= 32 and n * k >= 1048576:
+            encoded = model.packed_weights.get(w.data_ptr())
+            if encoded is None:
+                encoded = pack(w)
+            packed_copies = min(8, max(1, triton.cdiv(64 * 1024 * 1024,
+                                sum(t.numel() * t.element_size() for t in encoded[:3])) + 1))
+            packed_weights = [encoded] + [tuple(t.clone() for t in encoded)
+                                          for _ in range(packed_copies - 1)]
+            for config in ((64, 128, 4), (64, 128, 8), (32, 128, 4), (64, 256, 4)):
+                candidate = PackedProjection(batch, n, k, config, model.packed_weights)
+                elapsed = bench(candidate.packed, x, packed_weights)
+                if elapsed < best_time * 0.97:
+                    best, best_time = candidate, elapsed
+            if isinstance(best, PackedProjection):
+                model.packed_weights[w.data_ptr()] = encoded
+            del packed_weights, encoded
         plans[name] = by_shape[n, k] = best
         del weights
+    # Prepare selected representations for every layer before graph capture.
+    # BF16 originals are retained for the large prefill GEMMs.
+    for name, plan in plans.items():
+        if isinstance(plan, PackedProjection):
+            tensors = [model.lm_head] if name == "lm_head" else [getattr(layer, name) for layer in model.layers]
+            for weight in tensors:
+                if weight.data_ptr() not in model.packed_weights:
+                    model.packed_weights[weight.data_ptr()] = pack(weight)
     return plans
 
 

@@ -4,7 +4,6 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from runtime import Model, Generation
-from speculative import Speculative
 
 
 class Engine:
@@ -31,14 +30,8 @@ class Engine:
             if self.state is None or self.state.shape != shape:
                 # Only one workload is retained. Setup occurs during warmup.
                 self.state = None
-                if max_new_tokens > 1:
-                    self.state = Speculative(self.model, shape, width=4 if shape[0] <= 4 else 2)
-                else:
-                    self.state = Generation(self.model, shape)
+                self.state = Generation(self.model, shape)
             state = self.state
-            if max_new_tokens > 1:
-                yield from state.generate(input_ids, max_new_tokens)
-                return
             state.prefill(input_ids)
             yield state.tokens[:, 0].tolist()
             for _ in range(max_new_tokens - 1):
